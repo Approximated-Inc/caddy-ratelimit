@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -97,21 +98,23 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 	h.events = eventsAppIface.(*caddyevents.App)
 
-	if len(h.StorageRaw) > 0 {
-		val, err := ctx.LoadModule(h, "StorageRaw")
-		if err != nil {
-			return fmt.Errorf("loading storage module: %v", err)
-		}
-		stor, err := val.(caddy.StorageConverter).CertMagicStorage()
-		if err != nil {
-			return fmt.Errorf("creating storage value: %v", err)
-		}
-		h.storage = stor
-	} else {
-		h.storage = ctx.Storage()
-	}
-
+	// Only initialize storage when distributed rate limiting is configured,
+	// since storage is only used for cross-instance state sync.
 	if h.Distributed != nil {
+		if len(h.StorageRaw) > 0 {
+			val, err := ctx.LoadModule(h, "StorageRaw")
+			if err != nil {
+				return fmt.Errorf("loading storage module: %v", err)
+			}
+			stor, err := val.(caddy.StorageConverter).CertMagicStorage()
+			if err != nil {
+				return fmt.Errorf("creating storage value: %v", err)
+			}
+			h.storage = stor
+		} else {
+			h.storage = ctx.Storage()
+		}
+
 		// TODO: maybe choose defaults intelligently based on window durations?
 		if h.Distributed.ReadInterval == 0 {
 			h.Distributed.ReadInterval = caddy.Duration(5 * time.Second)
@@ -158,11 +161,12 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		h.random = weakrand.New(weakrand.NewSource(now().UnixNano()))
 	}
 
-	// clean up old rate limiters while handler is running
+	// Use a single global sweep goroutine shared across all handler instances,
+	// since sweep iterates the global rateLimits pool anyway.
 	if h.SweepInterval == 0 {
 		h.SweepInterval = caddy.Duration(1 * time.Minute)
 	}
-	go h.sweepRateLimiters(ctx)
+	startGlobalSweep(ctx, time.Duration(h.SweepInterval))
 
 	return nil
 }
@@ -257,23 +261,49 @@ func (h Handler) randomFloatInRange(min, max float64) float64 {
 	return min + h.random.Float64()*(max-min)
 }
 
-func (h Handler) sweepRateLimiters(ctx context.Context) {
-	cleanerTicker := time.NewTicker(time.Duration(h.SweepInterval))
-	defer cleanerTicker.Stop()
+// startGlobalSweep ensures a single sweep goroutine runs for the given context,
+// shared across all handler instances. This avoids spawning redundant goroutines
+// when many rate_limit handlers exist (e.g., one per virtual host).
+func startGlobalSweep(ctx context.Context, interval time.Duration) {
+	globalSweepMu.Lock()
+	defer globalSweepMu.Unlock()
 
-	for {
-		select {
-		case <-cleanerTicker.C:
-			rateLimits.Range(func(key, value interface{}) bool {
-				value.(*rateLimitersMap).sweep()
-				return true
-			})
-
-		case <-ctx.Done():
-			return
-		}
+	// If a sweep is already running for this context, don't start another
+	if globalSweepCancel != nil {
+		return
 	}
+
+	sweepCtx, cancel := context.WithCancel(ctx)
+	globalSweepCancel = cancel
+
+	go func() {
+		cleanerTicker := time.NewTicker(interval)
+		defer cleanerTicker.Stop()
+		defer func() {
+			globalSweepMu.Lock()
+			globalSweepCancel = nil
+			globalSweepMu.Unlock()
+		}()
+
+		for {
+			select {
+			case <-cleanerTicker.C:
+				rateLimits.Range(func(key, value interface{}) bool {
+					value.(*rateLimitersMap).sweep()
+					return true
+				})
+
+			case <-sweepCtx.Done():
+				return
+			}
+		}
+	}()
 }
+
+var (
+	globalSweepMu     sync.Mutex
+	globalSweepCancel context.CancelFunc
+)
 
 // rateLimits persists RL zones through config changes.
 var rateLimits = caddy.NewUsagePool()
