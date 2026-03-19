@@ -40,9 +40,10 @@ func parseCaddyfile(helper httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, e
 //
 //	rate_limit {
 //	    zone <name> {
-//	        key    <string>
-//	        window <duration>
-//	        events <max_events>
+//	        key       <string>
+//	        window    <duration>
+//	        events    <max_events>
+//	        algorithm <ring_buffer|sliding_window|gcra>
 //	        match {
 //	        	<matchers>
 //	        }
@@ -116,6 +117,21 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 						}
 
 						zone.MatcherSetsRaw = append(zone.MatcherSetsRaw, matcherSet)
+
+					case "algorithm":
+						if !d.NextArg() {
+							return d.ArgErr()
+						}
+						if zone.Algorithm != "" {
+							return d.Errf("zone algorithm already specified: %s", zone.Algorithm)
+						}
+						algo := d.Val()
+						switch algo {
+						case "ring_buffer", "sliding_window", "gcra":
+							zone.Algorithm = algo
+						default:
+							return d.Errf("unknown algorithm '%s'; valid values are: ring_buffer, sliding_window, gcra", algo)
+						}
 
 					default:
 						return d.Errf("unrecognized subdirective '%s'", d.Val())

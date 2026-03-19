@@ -180,7 +180,7 @@ func (h Handler) syncDistributedRead(ctx context.Context) error {
 // distributedRateLimiting enforces limiter (keyed by rlKey) in consideration of all other instances in the cluster.
 // If the limit is exceeded, the response is prepared and the relevant error is returned. Otherwise, a reservation
 // is made in the local limiter and no error is returned.
-func (h Handler) distributedRateLimiting(w http.ResponseWriter, r *http.Request, repl *caddy.Replacer, limiter *ringBufferRateLimiter, rlKey, zoneName string) error {
+func (h Handler) distributedRateLimiting(w http.ResponseWriter, r *http.Request, repl *caddy.Replacer, limiter rateLimiter, rlKey, zoneName string) error {
 	maxAllowed := limiter.MaxEvents()
 	window := limiter.Window()
 
@@ -214,18 +214,19 @@ func (h Handler) distributedRateLimiting(w http.ResponseWriter, r *http.Request,
 	// add our own internal count (we do this at the end instead of the beginning
 	// so the critical section over this limiter's lock is smaller), and make the
 	// reservation if we're within the limit
-	limiter.mu.Lock()
+	mu := limiter.getLock()
+	mu.Lock()
 	count, oldestLocalEvent := limiter.countUnsynced(now())
 	totalCount += count
 	if oldestLocalEvent.Before(oldestEvent) && oldestLocalEvent.After(now().Add(-window)) {
 		oldestEvent = oldestLocalEvent
 	}
 	if totalCount < maxAllowed {
-		limiter.reserve()
-		limiter.mu.Unlock()
+		limiter.reserveUnsynced()
+		mu.Unlock()
 		return nil
 	}
-	limiter.mu.Unlock()
+	mu.Unlock()
 
 	// otherwise, it appears limit has been exceeded
 	return h.rateLimitExceeded(w, r, repl, zoneName, rlKey, oldestEvent.Add(window).Sub(now()))

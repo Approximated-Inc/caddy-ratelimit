@@ -42,6 +42,14 @@ type RateLimit struct {
 	// Duration of the sliding window.
 	Window caddy.Duration `json:"window,omitempty"`
 
+	// Algorithm selects the rate limiting algorithm for this zone.
+	// Valid values: "ring_buffer" (default), "sliding_window", "gcra".
+	//
+	// "ring_buffer" uses a ring of timestamps (exact, O(max_events) memory per key).
+	// "sliding_window" uses two fixed-window counters with interpolation (~56 bytes per key, ~1-2% approximation).
+	// "gcra" uses the Generic Cell Rate Algorithm (~32 bytes per key, exact).
+	Algorithm string `json:"algorithm,omitempty"`
+
 	matcherSets caddyhttp.MatcherSets
 
 	zoneName string
@@ -57,6 +65,13 @@ func (rl *RateLimit) provision(ctx caddy.Context, name string) error {
 		return fmt.Errorf("max_events must be at least zero")
 	}
 
+	switch rl.Algorithm {
+	case "", "ring_buffer", "sliding_window", "gcra":
+		// valid
+	default:
+		return fmt.Errorf("unknown algorithm %q; valid values are: ring_buffer, sliding_window, gcra", rl.Algorithm)
+	}
+
 	if len(rl.MatcherSetsRaw) > 0 {
 		matcherSets, err := ctx.LoadModule(rl, "MatcherSetsRaw")
 		if err != nil {
@@ -69,7 +84,7 @@ func (rl *RateLimit) provision(ctx caddy.Context, name string) error {
 	}
 
 	// ensure rate limiter state endures across config changes
-	rl.limitersMap = newRateLimiterMap()
+	rl.limitersMap = newRateLimiterMap(rl.Algorithm)
 	if val, loaded := rateLimits.LoadOrStore(name, rl.limitersMap); loaded {
 		rl.limitersMap = val.(*rateLimitersMap)
 	}
@@ -82,30 +97,44 @@ func (rl *RateLimit) permissiveness() float64 {
 	return float64(rl.MaxEvents) / float64(rl.Window)
 }
 
-type rateLimitersMap struct {
-	limiters   map[string]*ringBufferRateLimiter
-	limitersMu sync.Mutex
+// newRateLimiter creates a new rate limiter using the specified algorithm.
+func newRateLimiter(algorithm string, maxEvents int, window time.Duration) rateLimiter {
+	switch algorithm {
+	case "sliding_window":
+		return newSlidingWindowRateLimiter(maxEvents, window)
+	case "gcra":
+		return newGCRARateLimiter(maxEvents, window)
+	default: // "ring_buffer" or ""
+		return newRingBufferRateLimiter(maxEvents, window)
+	}
 }
 
-func newRateLimiterMap() *rateLimitersMap {
-	var rlm rateLimitersMap
-	rlm.limiters = make(map[string]*ringBufferRateLimiter)
-	return &rlm
+type rateLimitersMap struct {
+	limiters   map[string]rateLimiter
+	limitersMu sync.Mutex
+	algorithm  string
+}
+
+func newRateLimiterMap(algorithm string) *rateLimitersMap {
+	return &rateLimitersMap{
+		limiters:  make(map[string]rateLimiter),
+		algorithm: algorithm,
+	}
 }
 
 // getOrInsert returns an existing rate limiter from the map, or inserts a new
 // one with the desired settings and returns it.
-func (rlm *rateLimitersMap) getOrInsert(key string, maxEvents int, window time.Duration) *ringBufferRateLimiter {
+func (rlm *rateLimitersMap) getOrInsert(key string, maxEvents int, window time.Duration) rateLimiter {
 	rlm.limitersMu.Lock()
 	defer rlm.limitersMu.Unlock()
 
-	rateLimiter, ok := rlm.limiters[key]
+	limiter, ok := rlm.limiters[key]
 	if !ok {
-		newRateLimiter := newRingBufferRateLimiter(maxEvents, window)
-		rlm.limiters[key] = newRateLimiter
-		return newRateLimiter
+		limiter = newRateLimiter(rlm.algorithm, maxEvents, window)
+		rlm.limiters[key] = limiter
+		return limiter
 	}
-	return rateLimiter
+	return limiter
 }
 
 // updateAll updates existing rate limiters with new settings.
@@ -125,30 +154,19 @@ func (rlm *rateLimitersMap) sweep() {
 	defer rlm.limitersMu.Unlock()
 
 	for key, rl := range rlm.limiters {
-		func(rl *ringBufferRateLimiter) {
-			rl.mu.Lock()
-			defer rl.mu.Unlock()
+		mu := rl.getLock()
+		mu.Lock()
 
-			// no point in keeping a ring buffer of size 0 around
-			if len(rl.ring) == 0 {
-				delete(rlm.limiters, key)
-				return
-			}
+		// Use Count to determine if any events are still in the window.
+		// If count is 0 and maxEvents is 0, the limiter can be removed.
+		count, _ := rl.countUnsynced(now())
+		maxEvents := rl.MaxEvents()
 
-			// get newest event in ring (should come right before oldest)
-			cursorNewest := rl.cursor - 1
-			if cursorNewest < 0 {
-				cursorNewest = len(rl.ring) - 1
-			}
-			newest := rl.ring[cursorNewest]
-			window := rl.window
+		if maxEvents == 0 || count == 0 {
+			delete(rlm.limiters, key)
+		}
 
-			// if newest event in memory is outside the window,
-			// the entire ring has expired and can be forgotten
-			if newest.Add(window).Before(now()) {
-				delete(rlm.limiters, key)
-			}
-		}(rl)
+		mu.Unlock()
 	}
 }
 

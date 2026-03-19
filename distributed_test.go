@@ -109,7 +109,7 @@ func TestDistributed(t *testing.T) {
 				}
 			}
 
-			zoneLimiters := newRateLimiterMap()
+			zoneLimiters := newRateLimiterMap("")
 			zoneLimiters.limiters["static"] = simulatedPeer
 
 			rlState := rlState{

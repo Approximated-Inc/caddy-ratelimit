@@ -208,5 +208,18 @@ func (r *ringBufferRateLimiter) countUnsynced(ref time.Time) (int, time.Time) {
 	return len(r.ring), r.ring[r.cursor]
 }
 
+// reserveUnsynced makes a reservation without acquiring the lock.
+func (r *ringBufferRateLimiter) reserveUnsynced() {
+	r.reserve()
+}
+
+// getLock returns the mutex for external locking.
+func (r *ringBufferRateLimiter) getLock() *sync.Mutex {
+	return &r.mu
+}
+
+// Interface guard
+var _ rateLimiter = (*ringBufferRateLimiter)(nil)
+
 // Current time function, to be substituted by tests
 var now = time.Now
