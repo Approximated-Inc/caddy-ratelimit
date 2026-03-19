@@ -157,12 +157,13 @@ func (rlm *rateLimitersMap) sweep() {
 		mu := rl.getLock()
 		mu.Lock()
 
-		// Use Count to determine if any events are still in the window.
-		// If count is 0 and maxEvents is 0, the limiter can be removed.
+		// Use countUnsynced to check if any events are still in the window.
+		// If count is 0, the limiter has expired and can be removed.
+		// NOTE: we must NOT call MaxEvents()/Window() here as they
+		// acquire the same mutex we already hold via getLock().
 		count, _ := rl.countUnsynced(now())
-		maxEvents := rl.MaxEvents()
 
-		if maxEvents == 0 || count == 0 {
+		if count == 0 {
 			delete(rlm.limiters, key)
 		}
 
