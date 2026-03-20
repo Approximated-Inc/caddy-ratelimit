@@ -89,19 +89,14 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 
 // Provision sets up the handler.
 func (h *Handler) Provision(ctx caddy.Context) error {
-	provisionStart := now()
 	h.ctx = ctx
 	h.logger = ctx.Logger(h)
 
-	t0 := now()
 	eventsAppIface, err := ctx.App("events")
 	if err != nil {
 		return fmt.Errorf("getting events app: %v", err)
 	}
 	h.events = eventsAppIface.(*caddyevents.App)
-	if dur := now().Sub(t0); dur > 50*time.Millisecond {
-		h.logger.Info("provision: ctx.App(events) slow", zap.Duration("duration", dur))
-	}
 
 	// Only initialize storage when distributed rate limiting is configured,
 	// since storage is only used for cross-instance state sync.
@@ -146,7 +141,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 
 	// provision each rate limit and put them in a slice so we can sort them
-	t1 := now()
 	for name, rl := range h.RateLimits {
 		rl.zoneName = name
 		err := rl.provision(ctx, name)
@@ -154,9 +148,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("setting up rate limit %s: %v", name, err)
 		}
 		h.rateLimits = append(h.rateLimits, rl)
-	}
-	if dur := now().Sub(t1); dur > 50*time.Millisecond {
-		h.logger.Info("provision: zone provisioning slow", zap.Duration("duration", dur), zap.Int("zones", len(h.RateLimits)))
 	}
 
 	// sort by tightest rate limit to most permissive (issue #10)
@@ -176,11 +167,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		h.SweepInterval = caddy.Duration(1 * time.Minute)
 	}
 	startGlobalSweep(ctx, time.Duration(h.SweepInterval))
-
-	totalDur := now().Sub(provisionStart)
-	if totalDur > 100*time.Millisecond {
-		h.logger.Warn("provision: handler took too long", zap.Duration("total", totalDur))
-	}
 
 	return nil
 }
