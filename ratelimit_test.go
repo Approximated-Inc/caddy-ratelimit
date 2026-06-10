@@ -126,6 +126,26 @@ func TestSweepKeepsActiveLimiters(t *testing.T) {
 	}
 }
 
+// TestSweepZeroMaxEventsRingBuffer verifies that sweep survives a ring_buffer
+// limiter with max_events 0 (zero-length ring). Regression test: countUnsynced
+// used to index the empty ring and panic, killing the sweeper goroutine and
+// the whole process with it.
+func TestSweepZeroMaxEventsRingBuffer(t *testing.T) {
+	initTime()
+
+	rlm := newRateLimiterMap("ring_buffer")
+	rlm.getOrInsert("empty", 0, 10*time.Second)
+
+	rlm.sweep()
+
+	rlm.limitersMu.Lock()
+	defer rlm.limitersMu.Unlock()
+
+	if _, ok := rlm.limiters["empty"]; ok {
+		t.Fatal("zero-max-events limiter should have been swept (count 0)")
+	}
+}
+
 // TestSweepConcurrentWithGetOrInsert verifies that sweep and getOrInsert
 // can run concurrently without deadlock.
 func TestSweepConcurrentWithGetOrInsert(t *testing.T) {

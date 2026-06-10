@@ -86,3 +86,25 @@ func TestCount(t *testing.T) {
 		t.Fatalf("oldest time %+v is wrong", oldest)
 	}
 }
+
+func TestRingBufferZeroMaxEvents(t *testing.T) {
+	initTime()
+
+	rb := newRingBufferRateLimiter(0, time.Minute)
+
+	count, oldest := rb.Count(now())
+	if count != 0 {
+		t.Errorf("expected count 0, got %d", count)
+	}
+	if !oldest.IsZero() {
+		t.Errorf("expected zero time, got %v", oldest)
+	}
+
+	if w := rb.When(); w != time.Minute {
+		t.Errorf("expected window (fail-closed) wait, got %v", w)
+	}
+
+	if rb.allowed() {
+		t.Error("zero-max-events ring must never allow")
+	}
+}
