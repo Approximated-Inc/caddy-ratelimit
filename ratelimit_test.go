@@ -15,9 +15,15 @@
 package caddyrl
 
 import (
+	"fmt"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/caddyserver/caddy/v2"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // TestSweepDoesNotDeadlock verifies that sweep() does not deadlock by
@@ -245,5 +251,261 @@ func TestGetOrInsertReturnsExisting(t *testing.T) {
 	count, _ := second.Count(now())
 	if count != 1 {
 		t.Fatal("getOrInsert should return existing limiter with its state")
+	}
+}
+
+// TestGetOrInsertCapAdmitsNewKey verifies that when a zone is at max_keys,
+// a new distinct key is still admitted (never rejected) while the map stays
+// at or under the cap.
+func TestGetOrInsertCapAdmitsNewKey(t *testing.T) {
+	for _, algo := range []string{"ring_buffer", "sliding_window", "gcra"} {
+		t.Run("algorithm_"+algo, func(t *testing.T) {
+			initTime()
+
+			const maxKeys = 20
+			rlm := newRateLimiterMap(algo)
+			rlm.configure(maxKeys, "test_zone", zap.NewNop())
+
+			// Fill to cap with live keys (each has an event in the window).
+			for i := 0; i < maxKeys; i++ {
+				rlm.getOrInsert(fmt.Sprintf("key%d", i), 10, 10*time.Second).When()
+			}
+			// One more distinct key pushes the zone over the cap.
+			rlm.getOrInsert("newest", 10, 10*time.Second).When()
+
+			rlm.limitersMu.Lock()
+			defer rlm.limitersMu.Unlock()
+			if len(rlm.limiters) > maxKeys {
+				t.Fatalf("limiter map exceeded max_keys: %d > %d", len(rlm.limiters), maxKeys)
+			}
+			if _, ok := rlm.limiters["newest"]; !ok {
+				t.Fatal("newest key should have been admitted, not rejected")
+			}
+		})
+	}
+}
+
+// TestGetOrInsertCapSweepsExpiredFirst verifies that hitting the cap first
+// reclaims expired keys before evicting any live ones.
+func TestGetOrInsertCapSweepsExpiredFirst(t *testing.T) {
+	initTime()
+
+	const maxKeys = 10
+	rlm := newRateLimiterMap("sliding_window")
+	rlm.configure(maxKeys, "test_zone", zap.NewNop())
+
+	// Two keys whose events will fully expire...
+	rlm.getOrInsert("expired1", 10, 10*time.Second).When()
+	rlm.getOrInsert("expired2", 10, 10*time.Second).When()
+
+	// ...by moving past the window (2x covers sliding window approximation)
+	advanceTime(21)
+
+	// Fill the rest of the cap with live keys.
+	for i := 0; i < maxKeys-2; i++ {
+		rlm.getOrInsert(fmt.Sprintf("live%d", i), 10, 10*time.Second).When()
+	}
+
+	rlm.getOrInsert("newest", 10, 10*time.Second).When()
+
+	rlm.limitersMu.Lock()
+	defer rlm.limitersMu.Unlock()
+	for _, key := range []string{"expired1", "expired2"} {
+		if _, ok := rlm.limiters[key]; ok {
+			t.Fatalf("%s should have been reclaimed by the at-cap sweep", key)
+		}
+	}
+	for i := 0; i < maxKeys-2; i++ {
+		key := fmt.Sprintf("live%d", i)
+		if _, ok := rlm.limiters[key]; !ok {
+			t.Fatalf("live key %s should not have been evicted while expired keys existed", key)
+		}
+	}
+	if _, ok := rlm.limiters["newest"]; !ok {
+		t.Fatal("newest key should have been admitted")
+	}
+}
+
+// TestGetOrInsertAtCapExistingKeyNoEviction verifies that looking up an
+// already-present key while the zone is at the cap evicts nothing.
+func TestGetOrInsertAtCapExistingKeyNoEviction(t *testing.T) {
+	initTime()
+
+	const maxKeys = 5
+	rlm := newRateLimiterMap("sliding_window")
+	rlm.configure(maxKeys, "test_zone", zap.NewNop())
+
+	for i := 0; i < maxKeys; i++ {
+		rlm.getOrInsert(fmt.Sprintf("key%d", i), 10, 10*time.Second).When()
+	}
+
+	limiter := rlm.getOrInsert("key0", 10, 10*time.Second)
+
+	count, _ := limiter.Count(now())
+	if count != 1 {
+		t.Fatalf("expected the existing limiter with 1 event, got count %d", count)
+	}
+	rlm.limitersMu.Lock()
+	defer rlm.limitersMu.Unlock()
+	if len(rlm.limiters) != maxKeys {
+		t.Fatalf("existing-key lookup must not evict: want %d keys, got %d", maxKeys, len(rlm.limiters))
+	}
+	for i := 0; i < maxKeys; i++ {
+		if _, ok := rlm.limiters[fmt.Sprintf("key%d", i)]; !ok {
+			t.Fatalf("key%d went missing after existing-key lookup", i)
+		}
+	}
+}
+
+// TestCapConcurrentWithSweepAndGetOrInsert mirrors
+// TestSweepConcurrentWithGetOrInsert with the max_keys cap engaged, so the
+// at-cap sweep/evict path runs concurrently with sweep() and updateAll().
+func TestCapConcurrentWithSweepAndGetOrInsert(t *testing.T) {
+	initTime()
+
+	const maxKeys = 10
+	rlm := newRateLimiterMap("sliding_window")
+	rlm.configure(maxKeys, "test_zone", zap.NewNop())
+
+	// Pre-populate past the cap so eviction engages immediately.
+	for i := 0; i < 20; i++ {
+		rlm.getOrInsert("key_"+string(rune('a'+i)), 10, 10*time.Second).When()
+	}
+
+	var wg sync.WaitGroup
+	done := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			rlm.sweep()
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			rlm.getOrInsert(fmt.Sprintf("churn%d", i), 10, 10*time.Second).When()
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			rlm.updateAll(5, 5*time.Second)
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// success - no deadlock
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent sweep/getOrInsert/updateAll deadlocked with cap engaged")
+	}
+
+	rlm.limitersMu.Lock()
+	defer rlm.limitersMu.Unlock()
+	if len(rlm.limiters) > maxKeys {
+		t.Fatalf("cap not enforced under concurrency: %d keys > %d", len(rlm.limiters), maxKeys)
+	}
+}
+
+// TestCapWarnRateLimited verifies the at-cap warning logs at most once per
+// minute per zone, no matter how many cap hits occur in that minute.
+func TestCapWarnRateLimited(t *testing.T) {
+	initTime()
+
+	core, logs := observer.New(zap.WarnLevel)
+	const maxKeys = 3
+	rlm := newRateLimiterMap("sliding_window")
+	rlm.configure(maxKeys, "warn_zone", zap.New(core))
+
+	fill := func(prefix string) {
+		for i := 0; i < maxKeys; i++ {
+			rlm.getOrInsert(fmt.Sprintf("%s%d", prefix, i), 10, 60*time.Second).When()
+		}
+	}
+
+	// Multiple cap hits within the same minute: only the first should warn.
+	fill("a")
+	rlm.getOrInsert("overA", 10, 60*time.Second).When() // cap hit (warns)
+	fill("b")                                           // refilling past the cap hits it again (suppressed)
+	if got := logs.FilterMessageSnippet("max_keys").Len(); got != 1 {
+		t.Fatalf("expected exactly 1 warn within the same minute, got %d", got)
+	}
+
+	// After a minute passes, the next cap hit warns again.
+	advanceTime(61)
+	fill("c")
+	if got := logs.FilterMessageSnippet("max_keys").Len(); got != 2 {
+		t.Fatalf("expected a second warn after a minute elapsed, got %d", got)
+	}
+}
+
+// TestProvisionDefaultsMaxKeys verifies that provision applies the 100k
+// default when max_keys is unset, and threads the cap into the zone's
+// limiter map (also when an explicit value is configured).
+func TestProvisionDefaultsMaxKeys(t *testing.T) {
+	tests := []struct {
+		name     string
+		maxKeys  int
+		expected int
+	}{
+		{"default_when_unset", 0, 100_000},
+		{"default_when_negative", -5, 100_000},
+		{"explicit_value_kept", 42, 42},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rl := &RateLimit{
+				Window:    caddy.Duration(10 * time.Second),
+				MaxEvents: 5,
+				MaxKeys:   tc.maxKeys,
+			}
+			zoneName := "provision_max_keys_" + tc.name
+			if err := rl.provision(caddy.Context{}, zoneName); err != nil {
+				t.Fatalf("provision: %v", err)
+			}
+			defer rateLimits.Delete(zoneName)
+
+			if rl.MaxKeys != tc.expected {
+				t.Fatalf("expected MaxKeys %d after provision, got %d", tc.expected, rl.MaxKeys)
+			}
+			rl.limitersMap.limitersMu.Lock()
+			defer rl.limitersMap.limitersMu.Unlock()
+			if rl.limitersMap.maxKeys != tc.expected {
+				t.Fatalf("expected limiter map cap %d, got %d", tc.expected, rl.limitersMap.maxKeys)
+			}
+		})
+	}
+}
+
+// BenchmarkGetOrInsertAtCap measures inserting new keys into a zone pinned at
+// the cap with 100k live keys, where every makeRoom sweep is a full O(n) scan
+// that reclaims nothing (worst case), amortized over the evicted batch.
+func BenchmarkGetOrInsertAtCap(b *testing.B) {
+	initTime()
+
+	const maxKeys = 100_000
+	rlm := newRateLimiterMap("sliding_window")
+	rlm.configure(maxKeys, "bench_zone", zap.NewNop())
+
+	// 1h window keeps every seeded key live so the sweep reclaims nothing.
+	for i := 0; i < maxKeys; i++ {
+		rlm.getOrInsert(strconv.Itoa(i), 10, time.Hour).When()
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rlm.getOrInsert("new"+strconv.Itoa(i), 10, time.Hour).When()
 	}
 }

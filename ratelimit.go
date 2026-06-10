@@ -21,6 +21,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"go.uber.org/zap"
 )
 
 // RateLimit describes an HTTP rate limit zone.
@@ -50,6 +51,15 @@ type RateLimit struct {
 	// "gcra" uses the Generic Cell Rate Algorithm (~32 bytes per key, exact).
 	Algorithm string `json:"algorithm,omitempty"`
 
+	// MaxKeys bounds the number of distinct keys (i.e. individual rate
+	// limiters) held in memory for this zone. When the zone is full,
+	// expired entries are reclaimed first; if none are expired, a small
+	// random batch is evicted so the new key is always admitted.
+	// Defaults to 100000. This deliberately diverges from upstream's
+	// unbounded maps: per-IP or per-host keys are otherwise a memory
+	// exhaustion vector (rotating-IP floods, wildcard subdomains).
+	MaxKeys int `json:"max_keys,omitempty"`
+
 	matcherSets caddyhttp.MatcherSets
 
 	zoneName string
@@ -63,6 +73,9 @@ func (rl *RateLimit) provision(ctx caddy.Context, name string) error {
 	}
 	if rl.MaxEvents < 0 {
 		return fmt.Errorf("max_events must be at least zero")
+	}
+	if rl.MaxKeys <= 0 {
+		rl.MaxKeys = 100_000
 	}
 
 	switch rl.Algorithm {
@@ -89,6 +102,7 @@ func (rl *RateLimit) provision(ctx caddy.Context, name string) error {
 		rl.limitersMap = val.(*rateLimitersMap)
 	}
 	rl.limitersMap.updateAll(rl.MaxEvents, time.Duration(rl.Window))
+	rl.limitersMap.configure(rl.MaxKeys, name, ctx.Logger())
 
 	return nil
 }
@@ -113,6 +127,14 @@ type rateLimitersMap struct {
 	limiters   map[string]rateLimiter
 	limitersMu sync.Mutex
 	algorithm  string
+
+	// cap on distinct keys (0 = unbounded; provision always sets it),
+	// plus zone identity/logging for the at-cap warning — all guarded
+	// by limitersMu
+	maxKeys     int
+	zoneName    string
+	logger      *zap.Logger
+	lastCapWarn time.Time
 }
 
 func newRateLimiterMap(algorithm string) *rateLimitersMap {
@@ -122,19 +144,69 @@ func newRateLimiterMap(algorithm string) *rateLimitersMap {
 	}
 }
 
+// configure sets the zone-level map settings. It runs at provision time,
+// including on reloads when the map is reused from the usage pool.
+func (rlm *rateLimitersMap) configure(maxKeys int, zoneName string, logger *zap.Logger) {
+	rlm.limitersMu.Lock()
+	defer rlm.limitersMu.Unlock()
+
+	rlm.maxKeys = maxKeys
+	rlm.zoneName = zoneName
+	rlm.logger = logger
+}
+
 // getOrInsert returns an existing rate limiter from the map, or inserts a new
-// one with the desired settings and returns it.
+// one with the desired settings and returns it. If the zone is at maxKeys,
+// room is made for the new key first.
 func (rlm *rateLimitersMap) getOrInsert(key string, maxEvents int, window time.Duration) rateLimiter {
 	rlm.limitersMu.Lock()
 	defer rlm.limitersMu.Unlock()
 
 	limiter, ok := rlm.limiters[key]
-	if !ok {
-		limiter = newRateLimiter(rlm.algorithm, maxEvents, window)
-		rlm.limiters[key] = limiter
+	if ok {
 		return limiter
 	}
+
+	if rlm.maxKeys > 0 && len(rlm.limiters) >= rlm.maxKeys {
+		rlm.makeRoom()
+	}
+
+	limiter = newRateLimiter(rlm.algorithm, maxEvents, window)
+	rlm.limiters[key] = limiter
 	return limiter
+}
+
+// capEvictBatch is how many entries makeRoom evicts when the sweep reclaims
+// nothing, keeping collateral damage to live limiters small.
+const capEvictBatch = 10
+
+// makeRoom frees space for a new key when the zone is at maxKeys: it sweeps
+// this zone's expired entries, and if the map is still full it evicts a small
+// random batch (map iteration order is effectively random). We never fail
+// closed here — rejecting new keys would turn a memory-exhaustion attack into
+// "deny all new visitors", and random eviction is about as good as LRU against
+// rotating-key attackers, who get fresh buckets either way. The caller must
+// hold limitersMu.
+func (rlm *rateLimitersMap) makeRoom() {
+	rlm.sweepUnsynced()
+
+	if len(rlm.limiters) >= rlm.maxKeys {
+		evicted := 0
+		for key := range rlm.limiters {
+			delete(rlm.limiters, key)
+			evicted++
+			if evicted >= capEvictBatch {
+				break
+			}
+		}
+	}
+
+	if rlm.logger != nil && now().Sub(rlm.lastCapWarn) >= time.Minute {
+		rlm.lastCapWarn = now()
+		rlm.logger.Warn("rate limit zone hit max_keys; making room for new keys",
+			zap.String("zone", rlm.zoneName),
+			zap.Int("max_keys", rlm.maxKeys))
+	}
 }
 
 // updateAll updates existing rate limiters with new settings.
@@ -152,7 +224,13 @@ func (rlm *rateLimitersMap) updateAll(maxEvents int, window time.Duration) {
 func (rlm *rateLimitersMap) sweep() {
 	rlm.limitersMu.Lock()
 	defer rlm.limitersMu.Unlock()
+	rlm.sweepUnsynced()
+}
 
+// sweepUnsynced removes expired rate limit states from this zone. The caller
+// must hold limitersMu (makeRoom runs at the cap with the mutex already held,
+// so calling the locking sweep() there would self-deadlock).
+func (rlm *rateLimitersMap) sweepUnsynced() {
 	for key, rl := range rlm.limiters {
 		mu := rl.getLock()
 		mu.Lock()

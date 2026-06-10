@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddytest"
 )
 
@@ -72,4 +73,73 @@ func TestCaddyfileRateLimits(t *testing.T) {
 	advanceTime(window)
 
 	tester.AssertGetResponse("http://localhost:8080", 200, "")
+}
+
+// TestCaddyfileMaxKeysParsing verifies the max_keys zone subdirective parses
+// and that it stays 0 (unset) at parse time when absent; the 100k default is
+// applied later, at provision.
+func TestCaddyfileMaxKeysParsing(t *testing.T) {
+	d := caddyfile.NewTestDispenser(`rate_limit {
+		zone capped {
+			key static
+			window 10s
+			events 5
+			max_keys 5000
+		}
+		zone uncapped {
+			key static
+			window 10s
+			events 5
+		}
+	}`)
+
+	var h Handler
+	if err := h.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("unmarshaling caddyfile: %v", err)
+	}
+	if got := h.RateLimits["capped"].MaxKeys; got != 5000 {
+		t.Fatalf("expected max_keys 5000, got %d", got)
+	}
+	if got := h.RateLimits["uncapped"].MaxKeys; got != 0 {
+		t.Fatalf("expected max_keys 0 (unset) at parse time, got %d", got)
+	}
+}
+
+// TestCaddyfileMaxKeysRejectsInvalid verifies non-integer and duplicate
+// max_keys values are rejected.
+func TestCaddyfileMaxKeysRejectsInvalid(t *testing.T) {
+	for name, config := range map[string]string{
+		"non_integer": `rate_limit {
+			zone bad {
+				key static
+				window 10s
+				events 5
+				max_keys lots
+			}
+		}`,
+		"missing_arg": `rate_limit {
+			zone bad {
+				key static
+				window 10s
+				events 5
+				max_keys
+			}
+		}`,
+		"duplicate": `rate_limit {
+			zone bad {
+				key static
+				window 10s
+				events 5
+				max_keys 5000
+				max_keys 6000
+			}
+		}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var h Handler
+			if err := h.UnmarshalCaddyfile(caddyfile.NewTestDispenser(config)); err == nil {
+				t.Fatal("expected an error, got none")
+			}
+		})
+	}
 }

@@ -43,6 +43,7 @@ func parseCaddyfile(helper httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, e
 //	        key       <string>
 //	        window    <duration>
 //	        events    <max_events>
+//	        max_keys  <int>
 //	        algorithm <ring_buffer|sliding_window|gcra>
 //	        match {
 //	        	<matchers>
@@ -109,6 +110,19 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 							return d.Errf("invalid max events integer '%s': %v", d.Val(), err)
 						}
 						zone.MaxEvents = maxEvents
+
+					case "max_keys":
+						if !d.NextArg() {
+							return d.ArgErr()
+						}
+						if zone.MaxKeys != 0 {
+							return d.Errf("zone max keys already specified: %v", zone.MaxKeys)
+						}
+						maxKeys, err := strconv.Atoi(d.Val())
+						if err != nil {
+							return d.Errf("invalid max keys integer '%s': %v", d.Val(), err)
+						}
+						zone.MaxKeys = maxKeys
 
 					case "match":
 						matcherSet, err := caddyhttp.ParseCaddyfileNestedMatcherSet(d)
