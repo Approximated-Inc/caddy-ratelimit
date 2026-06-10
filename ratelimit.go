@@ -131,10 +131,11 @@ type rateLimitersMap struct {
 	// cap on distinct keys (0 = unbounded; provision always sets it),
 	// plus zone identity/logging for the at-cap warning — all guarded
 	// by limitersMu
-	maxKeys     int
-	zoneName    string
-	logger      *zap.Logger
-	lastCapWarn time.Time
+	maxKeys      int
+	zoneName     string
+	logger       *zap.Logger
+	lastCapWarn  time.Time
+	lastCapSweep time.Time
 }
 
 func newRateLimiterMap(algorithm string) *rateLimitersMap {
@@ -180,15 +181,24 @@ func (rlm *rateLimitersMap) getOrInsert(key string, maxEvents int, window time.D
 // nothing, keeping collateral damage to live limiters small.
 const capEvictBatch = 10
 
+// capSweepInterval gates the full-zone expired-entry sweep in makeRoom: at
+// most one O(n) sweep per interval per zone. Without the gate, a rotating-key
+// flood at the cap triggers back-to-back full sweeps under limitersMu and
+// every request in the zone serializes behind them.
+const capSweepInterval = time.Second
+
 // makeRoom frees space for a new key when the zone is at maxKeys: it sweeps
-// this zone's expired entries, and if the map is still full it evicts a small
-// random batch (map iteration order is effectively random). We never fail
-// closed here — rejecting new keys would turn a memory-exhaustion attack into
-// "deny all new visitors", and random eviction is about as good as LRU against
-// rotating-key attackers, who get fresh buckets either way. The caller must
-// hold limitersMu.
+// this zone's expired entries (at most once per capSweepInterval), and if the
+// map is still full it evicts a small random batch (map iteration order is
+// effectively random). We never fail closed here — rejecting new keys would
+// turn a memory-exhaustion attack into "deny all new visitors", and random
+// eviction is about as good as LRU against rotating-key attackers, who get
+// fresh buckets either way. The caller must hold limitersMu.
 func (rlm *rateLimitersMap) makeRoom() {
-	rlm.sweepUnsynced()
+	if t := now(); t.Sub(rlm.lastCapSweep) >= capSweepInterval {
+		rlm.lastCapSweep = t
+		rlm.sweepUnsynced()
+	}
 
 	if len(rlm.limiters) >= rlm.maxKeys {
 		evicted := 0

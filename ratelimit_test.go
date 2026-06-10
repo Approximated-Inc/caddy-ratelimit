@@ -450,6 +450,96 @@ func TestCapWarnRateLimited(t *testing.T) {
 	}
 }
 
+// TestCapSweepTimeGated verifies the at-cap sweep runs at most once per
+// capSweepInterval per zone: a second cap hit inside the gate window skips
+// the O(n) sweep (expired entries survive; the random-evict batch makes room
+// instead), and a cap hit after the gate elapses sweeps them out. This keeps
+// rotating-key floods at the cap from serializing the whole zone behind
+// back-to-back full sweeps.
+func TestCapSweepTimeGated(t *testing.T) {
+	initTime()
+	// Sub-second clock control: the gate is 1s, so expired entries that
+	// appear between two in-gate cap hits need sub-second windows.
+	setClock := func(offset time.Duration) {
+		now = func() time.Time { return time.Unix(referenceTime, 0).Add(offset) }
+	}
+
+	const maxKeys = 30
+	rlm := newRateLimiterMap("sliding_window")
+	rlm.configure(maxKeys, "gate_zone", zap.NewNop())
+
+	// Fill to cap: 15 keys that will expire quickly, 15 long-lived ones.
+	for i := 0; i < 15; i++ {
+		rlm.getOrInsert(fmt.Sprintf("preexp%d", i), 10, 100*time.Millisecond).When()
+	}
+	for i := 0; i < 15; i++ {
+		rlm.getOrInsert(fmt.Sprintf("live%d", i), 10, time.Hour).When()
+	}
+
+	// Cap hit #1: zero-value lastCapSweep permits the sweep, which reclaims
+	// the 15 expired keys, so no eviction is needed.
+	setClock(300 * time.Millisecond)
+	rlm.getOrInsert("over1", 10, time.Hour).When()
+	rlm.limitersMu.Lock()
+	if got := len(rlm.limiters); got != 16 {
+		t.Fatalf("after first cap hit, expected sweep to reclaim 15 expired keys (16 left), got %d", got)
+	}
+	rlm.limitersMu.Unlock()
+
+	// Refill to cap with 14 keys that expire within the gate window.
+	for i := 0; i < 14; i++ {
+		rlm.getOrInsert(fmt.Sprintf("exp%d", i), 10, 100*time.Millisecond).When()
+	}
+
+	// Cap hit #2, 300ms after the last sweep (inside the gate): the sweep
+	// must be skipped, so the expired keys survive (eviction removes at most
+	// capEvictBatch of the 30) and the random-evict batch fires instead.
+	setClock(600 * time.Millisecond)
+	rlm.getOrInsert("over2", 10, time.Hour).When()
+
+	rlm.limitersMu.Lock()
+	if got, want := len(rlm.limiters), maxKeys-capEvictBatch+1; got != want {
+		t.Fatalf("in-gate cap hit should evict a batch, not sweep: want %d keys, got %d", want, got)
+	}
+	survivors := 0
+	for i := 0; i < 14; i++ {
+		if _, ok := rlm.limiters[fmt.Sprintf("exp%d", i)]; ok {
+			survivors++
+		}
+	}
+	rlm.limitersMu.Unlock()
+	if survivors == 0 {
+		t.Fatal("expired keys should survive an in-gate cap hit (sweep must be skipped)")
+	}
+
+	// Refill to cap, then advance past the gate: the next cap hit sweeps
+	// again and reclaims the surviving expired keys.
+	rlm.limitersMu.Lock()
+	missing := maxKeys - len(rlm.limiters)
+	rlm.limitersMu.Unlock()
+	for i := 0; i < missing; i++ {
+		rlm.getOrInsert(fmt.Sprintf("fill%d", i), 10, time.Hour).When()
+	}
+
+	setClock(2 * time.Second)
+	rlm.getOrInsert("over3", 10, time.Hour).When()
+
+	rlm.limitersMu.Lock()
+	defer rlm.limitersMu.Unlock()
+	for i := 0; i < 14; i++ {
+		key := fmt.Sprintf("exp%d", i)
+		if _, ok := rlm.limiters[key]; ok {
+			t.Fatalf("%s should have been reclaimed once the gate elapsed", key)
+		}
+	}
+	if _, ok := rlm.limiters["over3"]; !ok {
+		t.Fatal("over3 should have been admitted")
+	}
+	if got, want := len(rlm.limiters), maxKeys-survivors+1; got != want {
+		t.Fatalf("post-gate cap hit should sweep (no eviction): want %d keys, got %d", want, got)
+	}
+}
+
 // TestProvisionDefaultsMaxKeys verifies that provision applies the 100k
 // default when max_keys is unset, and threads the cap into the zone's
 // limiter map (also when an explicit value is configured).
