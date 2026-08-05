@@ -55,7 +55,7 @@ A zone is synonymous with a rate limit, being a number of events per duration. B
 
 Each zone may optionally filter the requests it applies to by specifying [request matchers](https://caddyserver.com/docs/modules/http#servers/routes/match).
 
-Unlike nginx's rate limit module, this one does not require you to set a memory bound. Instead, rate limiters are scanned every so often and expired ones are deleted so their memory can be recovered by the garbage collector: Caddy does not drop rate limiters on the floor and forget events like nginx does.
+Unlike nginx's rate limit module, this one does not require careful memory tuning. Rate limiters are scanned every so often and expired ones are deleted so their memory can be recovered by the garbage collector. Each zone is bounded by `max_keys` (default 100000): when a zone is at capacity, expired rate limiters are reclaimed first, and only if none are expired are a few evicted to admit new keys.
 
 ### Distributed rate limiting
 
@@ -80,7 +80,9 @@ This is an HTTP handler module, so it can be used wherever `http.handlers` modul
 			"match": [],
 			"key": "",
 			"window": "",
-			"max_events": 0
+			"max_events": 0,
+			"algorithm": "",
+			"max_keys": 0
 		},
 		"jitter": 0.0,
 		"sweep_interval": ""
@@ -97,6 +99,10 @@ This is an HTTP handler module, so it can be used wherever `http.handlers` modul
 
 
 All fields are optional, but to be useful, you'll need to define at least one zone, and a zone requires `window` and `max_events` to be set. Keys can be static (no placeholders) or dynamic (with placeholders). Matchers can be used to filter requests that apply to a zone. Replace `<name>` with your RL zone's name.
+
+Algorithm selects the rate limiting implementation for a zone: `ring_buffer` (default; exact, O(max_events) memory per key), `sliding_window` (~56 bytes per key, slight approximation), or `gcra` (~32 bytes per key, exact).
+
+Max keys bounds how many distinct keys (rate limiters) a zone holds in memory. The default is 100000.
 
 To enable distributed RL, set `distributed` to a non-null object. The default read and write intervals are 5s, but you should tune these for your individual deployments.
 
@@ -145,9 +151,11 @@ rate_limit {
 		match {
 			<matchers>
 		}
-		key    <string>
-		window <duration>
-		events <max_events>
+		key       <string>
+		window    <duration>
+		events    <max_events>
+		algorithm <ring_buffer|sliding_window|gcra>
+		max_keys  <int>
 	}
 	distributed {
 		read_interval  <duration>

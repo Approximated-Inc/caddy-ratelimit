@@ -15,7 +15,6 @@
 package caddyrl
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	weakrand "math/rand"
@@ -23,7 +22,6 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -77,6 +75,10 @@ type Handler struct {
 	logger     *zap.Logger
 	ctx        caddy.Context
 	events     *caddyevents.App
+
+	// whether this handler holds a reference on the shared sweeper
+	// (set only once Provision can no longer fail, so Cleanup stays balanced)
+	sweeperRef bool
 }
 
 // CaddyModule returns the Caddy module information.
@@ -162,12 +164,27 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 
 	// Use a single global sweep goroutine shared across all handler instances,
-	// since sweep iterates the global rateLimits pool anyway.
+	// since sweep iterates the global rateLimits pool anyway. Take the
+	// reference as the last step so a failed Provision never strands one.
 	if h.SweepInterval == 0 {
 		h.SweepInterval = caddy.Duration(1 * time.Minute)
 	}
-	startGlobalSweep(ctx, time.Duration(h.SweepInterval))
+	return h.startSweeper()
+}
 
+// startSweeper takes this handler's reference on the shared sweeper, creating
+// it if it isn't running. Known quirk: the first-provisioned handler's
+// SweepInterval wins until refs hit 0 (LoadOrNew constructs only once).
+func (h *Handler) startSweeper() error {
+	_, _, err := sweepers.LoadOrNew(sweeperPoolKey, func() (caddy.Destructor, error) {
+		s := &globalSweeper{interval: time.Duration(h.SweepInterval), stop: make(chan struct{})}
+		go s.run()
+		return s, nil
+	})
+	if err != nil {
+		return err
+	}
+	h.sweeperRef = true
 	return nil
 }
 
@@ -251,6 +268,12 @@ func (h *Handler) Cleanup() error {
 	for name := range h.RateLimits {
 		rateLimits.Delete(name)
 	}
+	// release this handler's reference on the shared sweeper; the gate keeps
+	// Provision/Cleanup balanced (negative UsagePool refcounts panic)
+	if h.sweeperRef {
+		h.sweeperRef = false
+		_, _ = sweepers.Delete(sweeperPoolKey)
+	}
 	return nil
 }
 
@@ -261,49 +284,43 @@ func (h Handler) randomFloatInRange(min, max float64) float64 {
 	return min + h.random.Float64()*(max-min)
 }
 
-// startGlobalSweep ensures a single sweep goroutine runs for the given context,
-// shared across all handler instances. This avoids spawning redundant goroutines
-// when many rate_limit handlers exist (e.g., one per virtual host).
-func startGlobalSweep(ctx context.Context, interval time.Duration) {
-	globalSweepMu.Lock()
-	defer globalSweepMu.Unlock()
+const sweeperPoolKey = "sweeper"
 
-	// If a sweep is already running for this context, don't start another
-	if globalSweepCancel != nil {
-		return
-	}
+// sweepers holds the single global sweeper, refcounted by live handlers via
+// caddy.UsagePool: reloads overlap (new config provisions before the old one
+// cleans up), so refs never hit 0 across a reload and the goroutine survives.
+// The old ctx-bound implementation died on every reload, leaving every other
+// config epoch with NO eviction at all. NOTE: do not put the sweeper in the
+// rateLimits pool — its Range type-asserts *rateLimitersMap.
+var sweepers = caddy.NewUsagePool()
 
-	sweepCtx, cancel := context.WithCancel(ctx)
-	globalSweepCancel = cancel
-
-	go func() {
-		cleanerTicker := time.NewTicker(interval)
-		defer cleanerTicker.Stop()
-		defer func() {
-			globalSweepMu.Lock()
-			globalSweepCancel = nil
-			globalSweepMu.Unlock()
-		}()
-
-		for {
-			select {
-			case <-cleanerTicker.C:
-				rateLimits.Range(func(key, value interface{}) bool {
-					value.(*rateLimitersMap).sweep()
-					return true
-				})
-
-			case <-sweepCtx.Done():
-				return
-			}
-		}
-	}()
+type globalSweeper struct {
+	interval time.Duration
+	stop     chan struct{}
 }
 
-var (
-	globalSweepMu     sync.Mutex
-	globalSweepCancel context.CancelFunc
-)
+func (s *globalSweeper) run() {
+	ticker := time.NewTicker(s.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			rateLimits.Range(func(_, value any) bool {
+				value.(*rateLimitersMap).sweep()
+				return true
+			})
+		case <-s.stop:
+			return
+		}
+	}
+}
+
+// Destruct runs when the last handler is cleaned up (config no longer has
+// any rate_limit handler, or shutdown).
+func (s *globalSweeper) Destruct() error {
+	close(s.stop)
+	return nil
+}
 
 // rateLimits persists RL zones through config changes.
 var rateLimits = caddy.NewUsagePool()

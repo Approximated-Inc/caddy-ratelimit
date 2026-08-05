@@ -56,6 +56,11 @@ func (r *ringBufferRateLimiter) When() time.Duration {
 	if r.allowed() {
 		return 0
 	}
+	// Zero-length ring: nothing is ever allowed; wait a full window
+	// (fail-closed, matching gcra/sliding_window semantics at max_events 0).
+	if len(r.ring) == 0 {
+		return r.window
+	}
 	return r.ring[r.cursor].Add(r.window).Sub(now())
 }
 
@@ -182,6 +187,13 @@ func (r *ringBufferRateLimiter) Count(ref time.Time) (int, time.Time) {
 // TODO: this is currently O(n) but could probably become O(log n) if we switch to some weird, custom binary search modulo ring length around the cursor.
 func (r *ringBufferRateLimiter) countUnsynced(ref time.Time) (int, time.Time) {
 	var zeroTime time.Time
+
+	// A zero-length ring (max_events 0) has no slots to index; report empty so
+	// the sweeper deletes the key instead of panicking the whole process.
+	if len(r.ring) == 0 {
+		return 0, zeroTime
+	}
+
 	beginningOfWindow := ref.Add(-r.window)
 
 	// This loop is a little gnarly, I know. We start at one before the cursor because that's
