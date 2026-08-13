@@ -20,6 +20,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -259,5 +260,114 @@ func TestPurgeDistributedState(t *testing.T) {
 	}
 	if len(dirEntries) != 0 {
 		t.Fatalf("storage directory was not empty: %v", dirEntries)
+	}
+}
+
+// orphanIndexStorage wraps a Storage and reports one extra key from List that
+// Load will never find. This reproduces the production condition seen with the
+// Redis storage backend, where List enumerates a sorted-set directory index and
+// the value key can disappear (eviction, or a Del that bypassed Delete) while
+// its index entry survives.
+type orphanIndexStorage struct {
+	certmagic.Storage
+
+	mu      sync.Mutex
+	orphan  string
+	deleted []string
+}
+
+func (s *orphanIndexStorage) List(ctx context.Context, dir string, recursive bool) ([]string, error) {
+	keys, err := s.Storage.List(ctx, dir, recursive)
+	if err != nil {
+		return keys, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.orphan != "" {
+		keys = append(keys, s.orphan)
+	}
+	return keys, nil
+}
+
+func (s *orphanIndexStorage) Delete(ctx context.Context, key string) error {
+	s.mu.Lock()
+	s.deleted = append(s.deleted, key)
+	isOrphan := key == s.orphan
+	if isOrphan {
+		// Deleting the key drops the stale index entry, so List stops
+		// reporting it — the behaviour a real backend gives us.
+		s.orphan = ""
+	}
+	s.mu.Unlock()
+
+	if isOrphan {
+		return nil
+	}
+	return s.Storage.Delete(ctx, key)
+}
+
+func (s *orphanIndexStorage) deletedKeys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.deleted...)
+}
+
+// An index entry whose value is missing can never be reclaimed by the purge
+// path (that requires a state that loaded AND decoded), so before the fix it
+// was re-listed and re-logged at ERROR on every read interval, forever. It
+// should be deleted on the first read instead, and must not disturb the states
+// that do load.
+func TestOrphanedDistributedStateEntryIsDeleted(t *testing.T) {
+	initTime()
+	ensureAppDataDir(t)
+	logger, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatalf("failed to create logger: %s", err)
+	}
+
+	fileStorage := &certmagic.FileStorage{Path: t.TempDir()}
+
+	// A healthy peer that must survive untouched.
+	healthy := rlState{Timestamp: now(), Zones: make(map[string]map[string]rlStateValue, 0)}
+	if err := writeRateLimitState(context.Background(), healthy, "12345678-1234-1234-1234-123456789abc", fileStorage); err != nil {
+		t.Fatalf("failed to write state to storage: %s", err)
+	}
+
+	orphanKey := path.Join(storagePrefix, "b137b85f-b981-44a9-b2ad-d8f672322182.rlstate")
+	storage := &orphanIndexStorage{Storage: fileStorage, orphan: orphanKey}
+
+	handler := Handler{
+		Distributed: &DistributedRateLimiting{
+			instanceID: "99999999-9999-9999-9999-999999999999",
+			PurgeAge:   caddy.Duration(time.Hour),
+		},
+		storage: storage,
+		logger:  logger,
+	}
+
+	if err := handler.syncDistributedRead(context.Background()); err != nil {
+		t.Fatalf("reading distributed state failed: %s", err)
+	}
+
+	// The loadable peer is still aggregated; the orphan is not.
+	if len(handler.Distributed.otherStates) != 1 {
+		t.Fatalf("expected exactly the healthy peer state, got: %v", handler.Distributed.otherStates)
+	}
+
+	deleted := storage.deletedKeys()
+	if len(deleted) != 1 || deleted[0] != orphanKey {
+		t.Fatalf("expected the orphaned entry %q to be deleted, deletes were: %v", orphanKey, deleted)
+	}
+
+	// Second pass: the orphan is gone from List, so nothing further is deleted
+	// and the healthy peer is still read.
+	if err := handler.syncDistributedRead(context.Background()); err != nil {
+		t.Fatalf("second read failed: %s", err)
+	}
+	if len(handler.Distributed.otherStates) != 1 {
+		t.Fatalf("healthy peer state lost on second read: %v", handler.Distributed.otherStates)
+	}
+	if got := storage.deletedKeys(); len(got) != 1 {
+		t.Fatalf("orphan should only be deleted once, deletes were: %v", got)
 	}
 }
