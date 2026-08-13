@@ -18,6 +18,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"errors"
+	"io/fs"
 	"net/http"
 	"path"
 	"strings"
@@ -142,6 +144,28 @@ func (h Handler) syncDistributedRead(ctx context.Context) error {
 
 		encoded, err := h.storage.Load(ctx, instanceFile)
 		if err != nil {
+			// A key that List returned but Load can't find is an orphaned
+			// directory entry: the value is gone while the index still
+			// references it. Storage backends that keep a separate index
+			// (e.g. the Redis module's sorted set) can end up this way if the
+			// value is evicted or removed without going through Delete.
+			//
+			// The purge below can never reclaim it — that path needs a state
+			// that loaded AND decoded — so without this the same key is
+			// re-listed, re-failed, and re-logged at ERROR on every read
+			// interval, forever. Drop the index entry instead.
+			if errors.Is(err, fs.ErrNotExist) {
+				if delErr := h.storage.Delete(ctx, instanceFile); delErr != nil {
+					h.logger.Warn("cannot delete orphaned rate limiter state entry",
+						zap.String("key", instanceFile),
+						zap.Error(delErr))
+				} else {
+					h.logger.Info("deleted orphaned rate limiter state entry",
+						zap.String("key", instanceFile))
+				}
+				continue
+			}
+
 			h.logger.Error("unable to load distributed rate limiter state",
 				zap.String("key", instanceFile),
 				zap.Error(err))
